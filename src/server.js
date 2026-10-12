@@ -22,9 +22,34 @@ function signToken(user) {
   return jwt.sign({ uid: user.id, email: user.email }, JWT_SECRET, { expiresIn: TOKEN_TTL });
 }
 
+/** Human-readable DB error for logs/responses (never leaks secrets). */
+function dbErrorInfo(e) {
+  const msg = String((e && e.message) || e || '');
+  // Surface the exact env-var problem instead of a generic 500.
+  if (!db.tokenLooksValid()) {
+    return 'База данных Turso недоступна: ' + db.tokenProblem() +
+      ' Получите реальный токен (Turso dashboard -> Database -> Show API parameters -> Auth token,' +
+      ' или `turso db tokens create <db>`) и обновите переменную окружения с токеном в Vercel, затем Redeploy.';
+  }
+  if (/401|Unauthorized|Invalid JWT|empty JWT/i.test(msg))
+    return 'База данных недоступна: auth-токен Turso не принят сервером (401).' +
+      ' Токен устарел или отозван — создайте новый (`turso db tokens create <db>`) и обновите переменную окружения в Vercel, затем Redeploy.';
+  if (/400|SERVER_ERROR/i.test(msg))
+    return 'База данных недоступна: Turso отклонил запрос (HTTP 400).' +
+      ' Проверьте переменные окружения *TURSO*DATABASE_URL / *TURSO*AUTH_TOKEN в Vercel' +
+      ' (без пробелов/кавычек, токен должен быть JWT из Turso dashboard), затем Redeploy.';
+  return msg || 'Внутренняя ошибка сервера';
+}
+
 function authRequired(req, res, next) {
-  const token =
-    req.cookies && req.cookies.mt_token ? req.cookies.mt_token : null;
+  // Session token comes from the httpOnly cookie (web SPA) or an Authorization
+  // header (API clients / future Telegram bot): "Authorization: Bearer <jwt>".
+  let token = req.cookies && req.cookies.mt_token ? req.cookies.mt_token : null;
+  if (!token) {
+    const h = req.headers.authorization || '';
+    const m = h.match(/^Bearer\s+(.+)$/i);
+    if (m) token = m[1];
+  }
   if (!token) return res.status(401).json({ error: 'Не авторизован' });
   try {
     const payload = jwt.verify(token, JWT_SECRET);
@@ -34,6 +59,36 @@ function authRequired(req, res, next) {
     return res.status(401).json({ error: 'Сессия истекла, войдите заново' });
   }
 }
+
+/* ---------------- diagnostics ---------------- */
+app.get('/api/health', async (req, res) => {
+  const info = {
+    ok: false,
+    databaseUrlHost: (() => {
+      try { return new URL(db.urlEnvName ? process.env[db.urlEnvName] : '').host; } catch (e) { return null; }
+    })(),
+    envVarsUsed: { url: db.urlEnvName, token: db.tokenEnvName },   // which names actually won
+    envVarsSeen: db.envNamesFound,                                 // all matching names found
+    tokenLooksValid: db.tokenLooksValid(),
+    tokenProblem: db.tokenProblem(),          // exact env-var problem, if any
+    usingLocalFallback: db.isLocalFallback(), // always false now (no fallback)
+    tables: [],
+    rolesSeeded: 0,
+    error: null,
+  };
+  try {
+    const rows = await db.all("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name");
+    info.tables = rows.map((r) => r.name);
+    const roleCount = await db.get('SELECT COUNT(*) AS n FROM roles');
+    info.rolesSeeded = roleCount ? Number(roleCount.n) : 0;
+    info.ok = true;
+  } catch (e) {
+    info.error = dbErrorInfo(e);
+    info.lastConnectError = db.lastConnectError();
+  }
+  // 503 when DB is down so monitoring/Vercel shows the deployment as unhealthy.
+  res.status(info.ok ? 200 : 503).json(info);
+});
 
 /* ---------------- auth routes ---------------- */
 app.post('/api/auth/register', async (req, res, next) => {
@@ -189,10 +244,11 @@ app.post('/api/connections', authRequired, async (req, res, next) => {
     if (!c1 || !c2) return res.status(404).json({ error: 'Один из контактов не найден' });
     const role = await db.get('SELECT * FROM roles WHERE id = ?', [rid]);
     if (!role) return res.status(404).json({ error: 'Роль не найдена' });
-    // Opposite role: symmetric => same role; asymmetric => the unique role whose
-    // name equals this role's opposite_name (e.g. Руководитель -> Подчиненный).
-    const role2 = await db.get('SELECT * FROM roles WHERE name = ?', [role.opposite_name]);
-    const role2Id = role.symmetric ? role.id : (role2 ? role2.id : rid);
+    // Asymmetric pairs are stored as a SINGLE roles row (e.g. id5
+    // name='Руководитель', opposite_name='Подчиненный'). There is no reverse
+    // row to reference, so role2_id points at the same pair row and the API
+    // renders side B's label from r1.opposite_name (see deriveRoleNames).
+    const role2Id = oppositeRoleId(role);
     const dup = await db.get(
       'SELECT id FROM connections WHERE contact1_id=? AND contact2_id=? AND role1_id=?',
       [id1, id2, rid]
@@ -207,11 +263,37 @@ app.post('/api/connections', authRequired, async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+/**
+ * Opposite role id for contact2 given the chosen role row.
+ * Roles table stores each asymmetric PAIR as ONE row (id5 Руководитель /
+ * opposite_name Подчиненный, id6 Супруг / Супруга, id7 Учитель / Ученик), so
+ * there is no separate reverse row to reference. We keep role2_id pointing at
+ * the same pair row and render side B's label via r1.opposite_name in the API
+ * responses (see deriveRoleNames). Symmetric pairs obviously use the same id.
+ */
+function oppositeRoleId(role) {
+  return role.id;
+}
+
+/** Attach human-readable role names for both sides of a connection row. */
+function deriveRoleNames(row) {
+  if (!row) return row;
+  // Side B shows the opposite label when the pair is asymmetric.
+  if (!row.role1_symmetric) {
+    row.role2_name = row.role1_opposite_name ?? row.role2_name;
+  }
+  return row;
+}
+
+const CONN_SELECT_COLS =
+  `x.*, c1.first_name AS contact1_first_name, c1.last_name AS contact1_last_name,
+          c2.first_name AS contact2_first_name, c2.last_name AS contact2_last_name,
+          r1.name AS role1_name, r1.opposite_name AS role1_opposite_name,
+          r1.symmetric AS role1_symmetric, r2.name AS role2_name`;
+
 async function getConnWithNames(id) {
-  return db.get(
-    `SELECT x.*, c1.first_name AS contact1_first_name, c1.last_name AS contact1_last_name,
-            c2.first_name AS contact2_first_name, c2.last_name AS contact2_last_name,
-            r1.name AS role1_name, r2.name AS role2_name
+  const row = await db.get(
+    `SELECT ${CONN_SELECT_COLS}
      FROM connections x
      JOIN contacts c1 ON c1.id=x.contact1_id
      JOIN contacts c2 ON c2.id=x.contact2_id
@@ -220,6 +302,7 @@ async function getConnWithNames(id) {
      WHERE x.id=?`,
     [id]
   );
+  return deriveRoleNames(row);
 }
 
 app.get('/api/connections', authRequired, async (req, res, next) => {
@@ -232,9 +315,7 @@ app.get('/api/connections', authRequired, async (req, res, next) => {
       args.push(cid, cid);
     }
     const sql =
-      `SELECT x.*, c1.first_name AS contact1_first_name, c1.last_name AS contact1_last_name,
-              c2.first_name AS contact2_first_name, c2.last_name AS contact2_last_name,
-              r1.name AS role1_name, r2.name AS role2_name
+      `SELECT ${CONN_SELECT_COLS}
        FROM connections x
        JOIN contacts c1 ON c1.id=x.contact1_id
        JOIN contacts c2 ON c2.id=x.contact2_id
@@ -242,7 +323,7 @@ app.get('/api/connections', authRequired, async (req, res, next) => {
        JOIN roles r2 ON r2.id=x.role2_id
        WHERE x.user_id = ? ${where.length ? 'AND ' + where.join(' AND ') : ''}
        ORDER BY x.created_at DESC`;
-    const rows = await db.all(sql, args);
+    const rows = (await db.all(sql, args)).map(deriveRoleNames);
     res.json({ connections: rows });
   } catch (e) { next(e); }
 });
@@ -261,8 +342,7 @@ app.put('/api/connections/:id', authRequired, async (req, res, next) => {
     if (!c1 || !c2) return res.status(404).json({ error: 'Один из контактов не найден' });
     const role = await db.get('SELECT * FROM roles WHERE id = ?', [rid]);
     if (!role) return res.status(404).json({ error: 'Роль не найдена' });
-    const role2Row = await db.get('SELECT * FROM roles WHERE name = ?', [role.opposite_name]);
-    const role2Id = role.symmetric ? role.id : (role2Row ? role2Row.id : rid);
+    const role2Id = oppositeRoleId(role);
     const dup = await db.get(
       'SELECT id FROM connections WHERE contact1_id=? AND contact2_id=? AND role1_id=? AND id != ?',
       [id1, id2, rid, conn.id]
@@ -353,20 +433,32 @@ app.get(/^\/(?!api\/).*/, (req, res) => {
 
 /* ---------------- error handler ---------------- */
 app.use((err, req, res, next) => {
-  console.error(err);
-  const msg = /401|Unauthorized|empty JWT/i.test(err.message || '')
-    ? 'База данных недоступна: проверьте MENTAL_TURSO_AUTH_TOKEN'
-    : 'Внутренняя ошибка сервера';
-  res.status(500).json({ error: msg });
+  console.error((err && err.message) || err);
+  res.status(500).json({ error: dbErrorInfo(err) });
 });
 
 /* ---------------- startup ---------------- */
-(async () => {
+async function ensureSchema() {
   try {
     await db.migrate();
-    console.log('DB schema ready');
+    console.log('DB schema ready' + (db.isLocalFallback() ? ' (LOCAL FALLBACK MODE — fix Turso credentials!)' : ''));
+    return true;
   } catch (e) {
-    console.error('WARNING: DB migration failed:', e.message);
+    console.error('DB migration failed:', dbErrorInfo(e));
+    return false;
   }
-  app.listen(PORT, () => console.log(`Mental Turso listening on http://localhost:${PORT}`));
+}
+
+// Retry migration in the background so that a transient Turso error doesn't
+// leave the deployment permanently without tables.
+(function migrateWithRetry(attempt = 1) {
+  ensureSchema().then((ok) => {
+    if (!ok && attempt < 5) {
+      const delay = Math.min(30000, 2000 * attempt);
+      console.log(`Retrying DB migration in ${delay}ms (attempt ${attempt + 1}/5)...`);
+      setTimeout(() => migrateWithRetry(attempt + 1), delay).unref();
+    }
+  });
 })();
+
+app.listen(PORT, () => console.log(`Mental Turso listening on http://localhost:${PORT}`));
