@@ -29,14 +29,14 @@ function dbErrorInfo(e) {
   if (!db.tokenLooksValid()) {
     return 'База данных Turso недоступна: ' + db.tokenProblem() +
       ' Получите реальный токен (Turso dashboard -> Database -> Show API parameters -> Auth token,' +
-      ' или `turso db tokens create <db>`) и обновите MENTAL_TURSO_AUTH_TOKEN в Vercel, затем Redeploy.';
+      ' или `turso db tokens create <db>`) и обновите переменную окружения с токеном в Vercel, затем Redeploy.';
   }
   if (/401|Unauthorized|Invalid JWT|empty JWT/i.test(msg))
-    return 'База данных недоступна: MENTAL_TURSO_AUTH_TOKEN не принят сервером Turso (401).' +
+    return 'База данных недоступна: auth-токен Turso не принят сервером (401).' +
       ' Токен устарел или отозван — создайте новый (`turso db tokens create <db>`) и обновите переменную окружения в Vercel, затем Redeploy.';
   if (/400|SERVER_ERROR/i.test(msg))
     return 'База данных недоступна: Turso отклонил запрос (HTTP 400).' +
-      ' Проверьте MENTAL_TURSO_DATABASE_URL и MENTAL_TURSO_AUTH_TOKEN в Vercel' +
+      ' Проверьте переменные окружения *TURSO*DATABASE_URL / *TURSO*AUTH_TOKEN в Vercel' +
       ' (без пробелов/кавычек, токен должен быть JWT из Turso dashboard), затем Redeploy.';
   return msg || 'Внутренняя ошибка сервера';
 }
@@ -65,8 +65,10 @@ app.get('/api/health', async (req, res) => {
   const info = {
     ok: false,
     databaseUrlHost: (() => {
-      try { return new URL(dbUrlForHealth()).host; } catch (e) { return null; }
+      try { return new URL(db.urlEnvName ? process.env[db.urlEnvName] : '').host; } catch (e) { return null; }
     })(),
+    envVarsUsed: { url: db.urlEnvName, token: db.tokenEnvName },   // which names actually won
+    envVarsSeen: db.envNamesFound,                                 // all matching names found
     tokenLooksValid: db.tokenLooksValid(),
     tokenProblem: db.tokenProblem(),          // exact env-var problem, if any
     usingLocalFallback: db.isLocalFallback(), // always false now (no fallback)
@@ -87,9 +89,6 @@ app.get('/api/health', async (req, res) => {
   // 503 when DB is down so monitoring/Vercel shows the deployment as unhealthy.
   res.status(info.ok ? 200 : 503).json(info);
 });
-function dbUrlForHealth() {
-  return process.env.MENTAL_TURSO_DATABASE_URL || 'http://invalid';
-}
 
 /* ---------------- auth routes ---------------- */
 app.post('/api/auth/register', async (req, res, next) => {

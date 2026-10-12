@@ -1,15 +1,20 @@
 // Turso (libSQL) database client wrapper.
-// Reads credentials from environment variables:
-//   MENTAL_TURSO_DATABASE_URL  - libsql:// URL of the database
-//   MENTAL_TURSO_AUTH_TOKEN    - JWT auth token for the database.
+//
+// Credentials are resolved from environment variables by NAME PATTERN, not by
+// one exact name, because the Vercel <-> Turso integration prefixes variables
+// with the project/database name (e.g. TURSO_DATABASE_URL / TURSO_AUTH_TOKEN or
+// MENTAL_TURSO_*). We accept any variable matching *TURSO*DATABASE_URL /
+// *TURSO*AUTH_TOKEN, preferring exact canonical names first, then prefixed
+// variants. This way manually-created unprefixed vars AND integration-provided
+// prefixed vars both work without code changes.
 //
 // IMPORTANT — why there is NO local fallback anymore:
 // A previous version silently fell back to a local ./local.db whenever Turso
-// rejected the credentials. On Vercel serverless filesystems are ephemeral and
-// read-only-ish, so every request created an empty local DB, migrations never
-// touched Turso ("no tables in Turso"), and the app appeared to work locally
-// while production was broken. Now we connect ONLY to Turso and fail loudly
-// with actionable diagnostics instead of masking the problem.
+// rejected the credentials. On Vercel serverless filesystems are ephemeral, so
+// every request created an empty local DB, migrations never touched Turso
+// ("no tables in Turso"), and the app appeared to work locally while
+// production was broken. Now we connect ONLY to Turso and fail loudly with
+// actionable diagnostics instead of masking the problem.
 //
 // A real Turso auth token is an ES256 JWT: three dot-separated base64url
 // segments. A placeholder/corrupted token (e.g. "dummytoken") makes the Turso
@@ -17,8 +22,40 @@
 // parsed — which is exactly why migrations failed and no tables were created.
 const { createClient } = require('@libsql/client');
 
-const rawUrl = process.env.MENTAL_TURSO_DATABASE_URL || '';
-const rawToken = process.env.MENTAL_TURSO_AUTH_TOKEN || '';
+const clean = (s) => String(s).trim().replace(/^["']|["']$/g, '');
+
+/**
+ * Collect all env vars whose name matches a pattern (case-insensitive),
+ * returning [{name, value}] sorted so that shorter names win
+ * (canonical unprefixed names take priority over prefixed ones).
+ */
+function collectEnv(pattern) {
+  const re = new RegExp(pattern, 'i');
+  return Object.entries(process.env)
+    .filter(([k, v]) => re.test(k) && v && clean(v))
+    .map(([name, value]) => ({ name, value: clean(value) }))
+    .sort((a, b) => a.name.length - b.name.length);
+}
+
+const urlCandidates = collectEnv('TURSO.*DATABASE_URL|TURSO_DB_URL|DATABASE_URL.*TURSO');
+const tokenCandidates = collectEnv('TURSO.*AUTH_TOKEN|TURSO.*TOKEN|AUTH_TOKEN.*TURSO');
+
+// Exclude obviously-placeholder tokens so they never shadow a real one.
+const PLACEHOLDER_RE = /^(dummy|test|placeholder|changeme|change-me|xxx+|todo)$/i;
+const usableTokens = tokenCandidates.filter(
+  (c) => c.value.split('.').length === 3 || !PLACEHOLDER_RE.test(c.value)
+);
+
+const urlSource = urlCandidates[0] || null;
+const tokenSource = usableTokens[0] || tokenCandidates[0] || null;
+
+const rawUrl = urlSource ? urlSource.value : '';
+const rawToken = tokenSource ? tokenSource.value : '';
+
+const envNamesFound = {
+  url: urlCandidates.map((c) => c.name),
+  token: tokenCandidates.map((c) => c.name),
+};
 
 // Normalize values: Vercel env vars sometimes carry stray whitespace or quotes
 // copy-pasted from the dashboard — both break the Turso handshake.
@@ -26,9 +63,10 @@ const url = rawUrl.trim().replace(/^["']|["']$/g, '');
 const authToken = rawToken.trim().replace(/^["']|["']$/g, '');
 
 if (!url) {
-  console.error('FATAL: MENTAL_TURSO_DATABASE_URL is not set.');
-  console.error('Add it in Vercel: Settings -> Environment Variables (and make sure the');
-  console.error('Turso Vercel integration actually populates this variable for Production).');
+  console.error('FATAL: No Turso database URL found in the environment.');
+  console.error('Looked for env vars matching *TURSO*DATABASE_URL (e.g. TURSO_DATABASE_URL,');
+  console.error('MENTAL_TURSO_DATABASE_URL). Set one in Vercel: Settings -> Environment');
+  console.error('Variables (or make sure the Turso integration populates it for Production).');
   process.exit(1);
 }
 
@@ -37,17 +75,17 @@ if (!url) {
  * Returns null when valid, otherwise a human-readable problem description.
  */
 function validateToken(tok) {
-  if (!tok) return 'MENTAL_TURSO_AUTH_TOKEN не задан (пустая переменная окружения).';
+  if (!tok) return 'No Turso auth token found in the environment (looked for *TURSO*AUTH_TOKEN vars).';
   const parts = tok.split('.');
   if (parts.length !== 3) {
-    return `MENTAL_TURSO_AUTH_TOKEN не является JWT (сегментов: ${parts.length}, ожидается 3). ` +
-      'В переменной окружения лежит значение-заглушка вместо реального токена Turso.';
+    return `Turso auth token is not a JWT (segments: ${parts.length}, expected 3). ` +
+      'The env var contains a placeholder/corrupted value instead of a real Turso token.';
   }
   try {
     const hdr = JSON.parse(Buffer.from(parts[0], 'base64url').toString());
-    if (!hdr.alg) return 'JWT без поля alg';
+    if (!hdr.alg) return 'JWT without alg field';
   } catch (e) {
-    return 'Первая часть MENTAL_TURSO_AUTH_TOKEN не декодируется как JWT header (битый base64 или подставное значение).';
+    return 'First segment of the Turso auth token does not decode as a JWT header (broken base64 or placeholder value).';
   }
   return null;
 }
@@ -55,10 +93,11 @@ function validateToken(tok) {
 const tokenProblem = validateToken(authToken);
 if (tokenProblem) {
   console.error('CRITICAL: ' + tokenProblem);
+  console.error(`Env vars containing "TURSO" found: URL=[${envNamesFound.url.join(', ')}] TOKEN=[${envNamesFound.token.join(', ')}]`);
   console.error('Every query to Turso will fail (HTTP 400) until this is fixed.');
   console.error('Fix: run `turso db tokens create <db-name>` (or use the Turso dashboard:');
   console.error('Database -> Show API parameters -> Auth token), then update the');
-  console.error('MENTAL_TURSO_AUTH_TOKEN env var in Vercel and REDEPLOY.');
+  console.error('auth-token env var in Vercel and REDEPLOY.');
 }
 
 // NOTE: pass the token only when non-empty — an empty-string authToken makes
@@ -213,4 +252,7 @@ module.exports = {
   tokenLooksValid: () => !validateToken(authToken),
   tokenProblem: () => validateToken(authToken),
   lastConnectError: () => lastConnectError,
+  envNamesFound,
+  urlEnvName: urlSource ? urlSource.name : null,
+  tokenEnvName: tokenSource ? tokenSource.name : null,
 };
