@@ -244,10 +244,11 @@ app.post('/api/connections', authRequired, async (req, res, next) => {
     if (!c1 || !c2) return res.status(404).json({ error: 'Один из контактов не найден' });
     const role = await db.get('SELECT * FROM roles WHERE id = ?', [rid]);
     if (!role) return res.status(404).json({ error: 'Роль не найдена' });
-    // Opposite role: symmetric => same role; asymmetric => the unique role whose
-    // name equals this role's opposite_name (e.g. Руководитель -> Подчиненный).
-    const role2 = await db.get('SELECT * FROM roles WHERE name = ?', [role.opposite_name]);
-    const role2Id = role.symmetric ? role.id : (role2 ? role2.id : rid);
+    // Asymmetric pairs are stored as a SINGLE roles row (e.g. id5
+    // name='Руководитель', opposite_name='Подчиненный'). There is no reverse
+    // row to reference, so role2_id points at the same pair row and the API
+    // renders side B's label from r1.opposite_name (see deriveRoleNames).
+    const role2Id = oppositeRoleId(role);
     const dup = await db.get(
       'SELECT id FROM connections WHERE contact1_id=? AND contact2_id=? AND role1_id=?',
       [id1, id2, rid]
@@ -262,11 +263,37 @@ app.post('/api/connections', authRequired, async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+/**
+ * Opposite role id for contact2 given the chosen role row.
+ * Roles table stores each asymmetric PAIR as ONE row (id5 Руководитель /
+ * opposite_name Подчиненный, id6 Супруг / Супруга, id7 Учитель / Ученик), so
+ * there is no separate reverse row to reference. We keep role2_id pointing at
+ * the same pair row and render side B's label via r1.opposite_name in the API
+ * responses (see deriveRoleNames). Symmetric pairs obviously use the same id.
+ */
+function oppositeRoleId(role) {
+  return role.id;
+}
+
+/** Attach human-readable role names for both sides of a connection row. */
+function deriveRoleNames(row) {
+  if (!row) return row;
+  // Side B shows the opposite label when the pair is asymmetric.
+  if (!row.role1_symmetric) {
+    row.role2_name = row.role1_opposite_name ?? row.role2_name;
+  }
+  return row;
+}
+
+const CONN_SELECT_COLS =
+  `x.*, c1.first_name AS contact1_first_name, c1.last_name AS contact1_last_name,
+          c2.first_name AS contact2_first_name, c2.last_name AS contact2_last_name,
+          r1.name AS role1_name, r1.opposite_name AS role1_opposite_name,
+          r1.symmetric AS role1_symmetric, r2.name AS role2_name`;
+
 async function getConnWithNames(id) {
-  return db.get(
-    `SELECT x.*, c1.first_name AS contact1_first_name, c1.last_name AS contact1_last_name,
-            c2.first_name AS contact2_first_name, c2.last_name AS contact2_last_name,
-            r1.name AS role1_name, r2.name AS role2_name
+  const row = await db.get(
+    `SELECT ${CONN_SELECT_COLS}
      FROM connections x
      JOIN contacts c1 ON c1.id=x.contact1_id
      JOIN contacts c2 ON c2.id=x.contact2_id
@@ -275,6 +302,7 @@ async function getConnWithNames(id) {
      WHERE x.id=?`,
     [id]
   );
+  return deriveRoleNames(row);
 }
 
 app.get('/api/connections', authRequired, async (req, res, next) => {
@@ -287,9 +315,7 @@ app.get('/api/connections', authRequired, async (req, res, next) => {
       args.push(cid, cid);
     }
     const sql =
-      `SELECT x.*, c1.first_name AS contact1_first_name, c1.last_name AS contact1_last_name,
-              c2.first_name AS contact2_first_name, c2.last_name AS contact2_last_name,
-              r1.name AS role1_name, r2.name AS role2_name
+      `SELECT ${CONN_SELECT_COLS}
        FROM connections x
        JOIN contacts c1 ON c1.id=x.contact1_id
        JOIN contacts c2 ON c2.id=x.contact2_id
@@ -297,7 +323,7 @@ app.get('/api/connections', authRequired, async (req, res, next) => {
        JOIN roles r2 ON r2.id=x.role2_id
        WHERE x.user_id = ? ${where.length ? 'AND ' + where.join(' AND ') : ''}
        ORDER BY x.created_at DESC`;
-    const rows = await db.all(sql, args);
+    const rows = (await db.all(sql, args)).map(deriveRoleNames);
     res.json({ connections: rows });
   } catch (e) { next(e); }
 });
@@ -316,8 +342,7 @@ app.put('/api/connections/:id', authRequired, async (req, res, next) => {
     if (!c1 || !c2) return res.status(404).json({ error: 'Один из контактов не найден' });
     const role = await db.get('SELECT * FROM roles WHERE id = ?', [rid]);
     if (!role) return res.status(404).json({ error: 'Роль не найдена' });
-    const role2Row = await db.get('SELECT * FROM roles WHERE name = ?', [role.opposite_name]);
-    const role2Id = role.symmetric ? role.id : (role2Row ? role2Row.id : rid);
+    const role2Id = oppositeRoleId(role);
     const dup = await db.get(
       'SELECT id FROM connections WHERE contact1_id=? AND contact2_id=? AND role1_id=? AND id != ?',
       [id1, id2, rid, conn.id]
