@@ -40,14 +40,25 @@ function collectEnv(pattern) {
 const urlCandidates = collectEnv('TURSO.*DATABASE_URL|TURSO_DB_URL|DATABASE_URL.*TURSO');
 const tokenCandidates = collectEnv('TURSO.*AUTH_TOKEN|TURSO.*TOKEN|AUTH_TOKEN.*TURSO');
 
-// Exclude obviously-placeholder tokens so they never shadow a real one.
-const PLACEHOLDER_RE = /^(dummy|test|placeholder|changeme|change-me|xxx+|todo)$/i;
-const usableTokens = tokenCandidates.filter(
-  (c) => c.value.split('.').length === 3 || !PLACEHOLDER_RE.test(c.value)
-);
+// A USABLE Turso auth token must be an ES256 JWT: exactly three dot-separated
+// segments and a reasonable length. Anything else ("dummytoken", empty strings,
+// truncated pastes) is a broken/placeholder value that the Turso server rejects
+// with "JWT error: InvalidToken" — such values are SKIPPED entirely so they can
+// never shadow a good token stored in another env var (e.g. a manually created
+// unprefixed TURSO_AUTH_TOKEN next to an integration-provided prefixed one).
+function looksLikeTursoJwt(v) {
+  if (!v) return false;
+  const parts = v.split('.');
+  return parts.length === 3 && v.length > 80 && /^eyJ/.test(parts[0]);
+}
+const usableTokens = tokenCandidates.filter((c) => looksLikeTursoJwt(c.value));
 
 const urlSource = urlCandidates[0] || null;
-const tokenSource = usableTokens[0] || tokenCandidates[0] || null;
+// Prefer variables whose NAME says AUTH_TOKEN (shortest name wins), but only
+// among tokens that actually look valid; fall back to any candidate for
+// diagnostics purposes.
+const byAuthName = usableTokens.filter((c) => /AUTH_TOKEN/i.test(c.name));
+const tokenSource = byAuthName[0] || usableTokens[0] || tokenCandidates[0] || null;
 
 const rawUrl = urlSource ? urlSource.value : '';
 const rawToken = tokenSource ? tokenSource.value : '';
@@ -55,6 +66,10 @@ const rawToken = tokenSource ? tokenSource.value : '';
 const envNamesFound = {
   url: urlCandidates.map((c) => c.name),
   token: tokenCandidates.map((c) => c.name),
+  // Token variables whose VALUE is a syntactically valid Turso JWT. If this
+  // list is empty while `token` is not — every token var in the environment
+  // contains a broken/placeholder value (the classic "dummytoken" case).
+  usableToken: usableTokens.map((c) => c.name),
 };
 
 // Normalize values: Vercel env vars sometimes carry stray whitespace or quotes
