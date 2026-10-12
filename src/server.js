@@ -22,9 +22,34 @@ function signToken(user) {
   return jwt.sign({ uid: user.id, email: user.email }, JWT_SECRET, { expiresIn: TOKEN_TTL });
 }
 
+/** Human-readable DB error for logs/responses (never leaks secrets). */
+function dbErrorInfo(e) {
+  const msg = String((e && e.message) || e || '');
+  // Surface the exact env-var problem instead of a generic 500.
+  if (!db.tokenLooksValid()) {
+    return 'База данных Turso недоступна: ' + db.tokenProblem() +
+      ' Получите реальный токен (Turso dashboard -> Database -> Show API parameters -> Auth token,' +
+      ' или `turso db tokens create <db>`) и обновите MENTAL_TURSO_AUTH_TOKEN в Vercel, затем Redeploy.';
+  }
+  if (/401|Unauthorized|Invalid JWT|empty JWT/i.test(msg))
+    return 'База данных недоступна: MENTAL_TURSO_AUTH_TOKEN не принят сервером Turso (401).' +
+      ' Токен устарел или отозван — создайте новый (`turso db tokens create <db>`) и обновите переменную окружения в Vercel, затем Redeploy.';
+  if (/400|SERVER_ERROR/i.test(msg))
+    return 'База данных недоступна: Turso отклонил запрос (HTTP 400).' +
+      ' Проверьте MENTAL_TURSO_DATABASE_URL и MENTAL_TURSO_AUTH_TOKEN в Vercel' +
+      ' (без пробелов/кавычек, токен должен быть JWT из Turso dashboard), затем Redeploy.';
+  return msg || 'Внутренняя ошибка сервера';
+}
+
 function authRequired(req, res, next) {
-  const token =
-    req.cookies && req.cookies.mt_token ? req.cookies.mt_token : null;
+  // Session token comes from the httpOnly cookie (web SPA) or an Authorization
+  // header (API clients / future Telegram bot): "Authorization: Bearer <jwt>".
+  let token = req.cookies && req.cookies.mt_token ? req.cookies.mt_token : null;
+  if (!token) {
+    const h = req.headers.authorization || '';
+    const m = h.match(/^Bearer\s+(.+)$/i);
+    if (m) token = m[1];
+  }
   if (!token) return res.status(401).json({ error: 'Не авторизован' });
   try {
     const payload = jwt.verify(token, JWT_SECRET);
@@ -33,6 +58,37 @@ function authRequired(req, res, next) {
   } catch (e) {
     return res.status(401).json({ error: 'Сессия истекла, войдите заново' });
   }
+}
+
+/* ---------------- diagnostics ---------------- */
+app.get('/api/health', async (req, res) => {
+  const info = {
+    ok: false,
+    databaseUrlHost: (() => {
+      try { return new URL(dbUrlForHealth()).host; } catch (e) { return null; }
+    })(),
+    tokenLooksValid: db.tokenLooksValid(),
+    tokenProblem: db.tokenProblem(),          // exact env-var problem, if any
+    usingLocalFallback: db.isLocalFallback(), // always false now (no fallback)
+    tables: [],
+    rolesSeeded: 0,
+    error: null,
+  };
+  try {
+    const rows = await db.all("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name");
+    info.tables = rows.map((r) => r.name);
+    const roleCount = await db.get('SELECT COUNT(*) AS n FROM roles');
+    info.rolesSeeded = roleCount ? Number(roleCount.n) : 0;
+    info.ok = true;
+  } catch (e) {
+    info.error = dbErrorInfo(e);
+    info.lastConnectError = db.lastConnectError();
+  }
+  // 503 when DB is down so monitoring/Vercel shows the deployment as unhealthy.
+  res.status(info.ok ? 200 : 503).json(info);
+});
+function dbUrlForHealth() {
+  return process.env.MENTAL_TURSO_DATABASE_URL || 'http://invalid';
 }
 
 /* ---------------- auth routes ---------------- */
@@ -353,20 +409,32 @@ app.get(/^\/(?!api\/).*/, (req, res) => {
 
 /* ---------------- error handler ---------------- */
 app.use((err, req, res, next) => {
-  console.error(err);
-  const msg = /401|Unauthorized|empty JWT/i.test(err.message || '')
-    ? 'База данных недоступна: проверьте MENTAL_TURSO_AUTH_TOKEN'
-    : 'Внутренняя ошибка сервера';
-  res.status(500).json({ error: msg });
+  console.error((err && err.message) || err);
+  res.status(500).json({ error: dbErrorInfo(err) });
 });
 
 /* ---------------- startup ---------------- */
-(async () => {
+async function ensureSchema() {
   try {
     await db.migrate();
-    console.log('DB schema ready');
+    console.log('DB schema ready' + (db.isLocalFallback() ? ' (LOCAL FALLBACK MODE — fix Turso credentials!)' : ''));
+    return true;
   } catch (e) {
-    console.error('WARNING: DB migration failed:', e.message);
+    console.error('DB migration failed:', dbErrorInfo(e));
+    return false;
   }
-  app.listen(PORT, () => console.log(`Mental Turso listening on http://localhost:${PORT}`));
+}
+
+// Retry migration in the background so that a transient Turso error doesn't
+// leave the deployment permanently without tables.
+(function migrateWithRetry(attempt = 1) {
+  ensureSchema().then((ok) => {
+    if (!ok && attempt < 5) {
+      const delay = Math.min(30000, 2000 * attempt);
+      console.log(`Retrying DB migration in ${delay}ms (attempt ${attempt + 1}/5)...`);
+      setTimeout(() => migrateWithRetry(attempt + 1), delay).unref();
+    }
+  });
 })();
+
+app.listen(PORT, () => console.log(`Mental Turso listening on http://localhost:${PORT}`));
